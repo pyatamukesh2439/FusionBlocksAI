@@ -1,4 +1,4 @@
-﻿package com.fusion.aicontroller.service
+package com.fusion.aicontroller.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
@@ -13,6 +13,8 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
@@ -59,7 +61,11 @@ class FusionAccessibilityService : AccessibilityService() {
         instance = null
     }
 
-    fun dragAndDrop(fromX: Float, fromY: Float, toX: Float, toY: Float, durationMs: Long = 340L) {
+    /**
+     * Physics-Calibrated Drag & Drop:
+     * Touches down, holds to pick up the block, drags smoothly, and releases into the grid.
+     */
+    fun dragAndDropWithHold(fromX: Float, fromY: Float, toX: Float, toY: Float, durationMs: Long = 420L) {
         val path = Path().apply {
             moveTo(fromX, fromY)
             lineTo(toX, toY)
@@ -84,6 +90,7 @@ class OverlayService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private lateinit var windowManager: WindowManager
     private var overlayView: View? = null
+    private var screenCaptureManager: ScreenCaptureManager? = null
     private var puzzleSolverJob: Job? = null
 
     private var btnAiPlay: Button? = null
@@ -94,6 +101,8 @@ class OverlayService : Service() {
         const val NOTIFICATION_ID = 2001
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
+        const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
+        const val EXTRA_DATA_INTENT = "EXTRA_DATA_INTENT"
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -101,13 +110,29 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        screenCaptureManager = ScreenCaptureManager(this)
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                startForeground(NOTIFICATION_ID, buildNotification("Fusion Blocks AI Ready"))
+                startForeground(NOTIFICATION_ID, buildNotification("Fusion Blocks AI Grandmaster Ready"))
+
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+                val dataIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_DATA_INTENT, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_DATA_INTENT)
+                }
+
+                if (resultCode != 0 && dataIntent != null) {
+                    val mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    val projection: MediaProjection = mediaProjectionManager.getMediaProjection(resultCode, dataIntent)
+                    screenCaptureManager?.startCapture(projection)
+                }
+
                 showFloatingOverlay()
             }
             ACTION_STOP -> {
@@ -130,7 +155,7 @@ class OverlayService : Service() {
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = 50
-            y = 120
+            y = 100
         }
 
         val container = LinearLayout(this).apply {
@@ -164,7 +189,7 @@ class OverlayService : Service() {
             setTextColor(Color.WHITE)
             textSize = 12f
             setOnClickListener {
-                startIntelligentSolver()
+                startGrandmasterSolver()
             }
         }
         btnAiPlay = playButton
@@ -233,14 +258,14 @@ class OverlayService : Service() {
     }
 
     /**
-     * Strategic Puzzle Solver (Dellacherie Algorithm):
-     * Simulates placement options, prioritizes Line Clears (+1000) and Corner/Wall Packing (+80),
-     * and strictly penalizes isolated single-cell holes (-250).
+     * Grandmaster Puzzle AI:
+     * Reads real-time live board from ScreenCaptureManager, compensates for the game's upward finger offset,
+     * and evaluates multi-objective placements (Line Clears + Corner/Wall Packing + Hole Elimination).
      */
-    private fun startIntelligentSolver() {
+    private fun startGrandmasterSolver() {
         val tapService = FusionAccessibilityService.instance
         if (tapService == null) {
-            Toast.makeText(this, "Enable Fusion Blocks AI in Accessibility Settings!", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Enable Fusion Blocks in Accessibility Settings!", Toast.LENGTH_LONG).show()
             val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
@@ -263,7 +288,7 @@ class OverlayService : Service() {
             setBackgroundColor(Color.parseColor("#00B0FF"))
         }
 
-        Toast.makeText(this, "🟢 Fusion Blocks Intelligent AI Active!", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "🧠 Grandmaster Puzzle AI Active!", Toast.LENGTH_SHORT).show()
         ControllerStateRepository.setStatus(ControllerStatus.RUNNING)
 
         puzzleSolverJob = serviceScope.launch(Dispatchers.Main) {
@@ -283,110 +308,103 @@ class OverlayService : Service() {
             val cellW = (gridRight - gridLeft) / 8f
             val cellH = (gridBottom - gridTop) / 8f
 
-            // Calibrated 3 Bottom Piece Slots (left side, avoiding ad on right)
+            // UPWARD FINGER OFFSET COMPENSATION:
+            // The game floats the block ~1.5 cells ABOVE your finger.
+            // We pull the finger DOWN by 1.3 cells so the floating block lands dead center!
+            val fingerOffsetY = cellH * 1.3f
+
+            // Calibrated 3 Bottom Piece Slots
             val slotY = screenH * 0.845f
-            val slot1X = screenW * 0.165f // Purple 1x1 slot
-            val slot2X = screenW * 0.345f // Center shape slot
-            val slot3X = screenW * 0.520f // Line / shape slot
+            val slot1X = screenW * 0.165f
+            val slot2X = screenW * 0.345f
+            val slot3X = screenW * 0.520f
             val slots = listOf(slot1X, slot2X, slot3X)
 
-            // Internal Virtual Board State for Strategic Planning
-            val virtualBoard = Array(8) { IntArray(8) }
-
-            // Candidate priority order: Evaluates Corner & Edge cells first to pack walls
-            val strategicPriorityOrder = mutableListOf<Pair<Int, Int>>()
-            // 1. Four Corners (Safest anchors)
-            strategicPriorityOrder.addAll(listOf(Pair(7, 0), Pair(7, 7), Pair(0, 0), Pair(0, 7)))
-            // 2. Bottom Row & Top Row edges
-            for (c in 1..6) {
-                strategicPriorityOrder.add(Pair(7, c))
-                strategicPriorityOrder.add(Pair(0, c))
-            }
-            // 3. Left & Right Columns
-            for (r in 1..6) {
-                strategicPriorityOrder.add(Pair(r, 0))
-                strategicPriorityOrder.add(Pair(r, 7))
-            }
-            // 4. Inner remaining grid
+            // Corner & Wall packing priority
+            val candidates = mutableListOf<Pair<Int, Int>>()
+            candidates.addAll(listOf(Pair(7, 0), Pair(7, 7), Pair(0, 0), Pair(0, 7)))
+            for (c in 1..6) { candidates.add(Pair(7, c)); candidates.add(Pair(0, c)) }
+            for (r in 1..6) { candidates.add(Pair(r, 0)); candidates.add(Pair(r, 7)) }
             for (r in 6 downTo 1) {
-                for (c in 1..6) {
-                    strategicPriorityOrder.add(Pair(r, c))
-                }
+                for (c in 1..6) { candidates.add(Pair(r, c)) }
             }
-
-            var cycle = 0
 
             while (isActive) {
-                // Cycle through the 3 bottom piece slots
+                val currentBoard = ScreenCaptureManager.liveBoard
+                val activeSlots = ScreenCaptureManager.activeSlots
+
+                var placedAtLeastOne = false
+
+                // Evaluate each available piece slot
                 for (slotIndex in 0 until 3) {
                     if (!isActive) break
+                    if (!activeSlots[slotIndex]) continue
 
                     val fromSlotX = slots[slotIndex]
 
                     // Find best candidate cell using Heuristic Evaluation
                     var bestScore = -99999
-                    var bestCell = strategicPriorityOrder.first()
+                    var bestTarget: Pair<Int, Int>? = null
 
-                    for (candidate in strategicPriorityOrder) {
-                        val r = candidate.first
-                        val c = candidate.second
+                    for (pos in candidates) {
+                        val r = pos.first
+                        val c = pos.second
 
-                        if (virtualBoard[r][c] == 0) {
+                        // Only consider empty cells
+                        if (currentBoard[r][c] == 0) {
                             var score = 0
 
-                            // 1. Check Line Clear Potential (+1000)
+                            // 1. Line Clear Potential (+1000)
                             var rowCount = 1
-                            for (cc in 0..7) if (cc != c && virtualBoard[r][cc] == 1) rowCount++
-                            if (rowCount >= 7) score += 1000 // Close to completing full row!
+                            for (cc in 0..7) if (cc != c && currentBoard[r][cc] == 1) rowCount++
+                            if (rowCount >= 7) score += 1000
 
                             var colCount = 1
-                            for (rr in 0..7) if (rr != r && virtualBoard[rr][c] == 1) colCount++
-                            if (colCount >= 7) score += 1000 // Close to completing full column!
+                            for (rr in 0..7) if (rr != r && currentBoard[rr][c] == 1) colCount++
+                            if (colCount >= 7) score += 1000
 
-                            // 2. Wall / Corner Clamping Bonus (+80)
+                            // 2. Corner & Wall Clamping (+80)
                             if (r == 0 || r == 7 || c == 0 || c == 7) score += 80
 
-                            // 3. Adjacency to existing blocks (+50)
-                            if (r > 0 && virtualBoard[r - 1][c] == 1) score += 50
-                            if (r < 7 && virtualBoard[r + 1][c] == 1) score += 50
-                            if (c > 0 && virtualBoard[r][c - 1] == 1) score += 50
-                            if (c < 7 && virtualBoard[r][c + 1] == 1) score += 50
+                            // 3. Adjacency Bonus (+50)
+                            if (r > 0 && currentBoard[r - 1][c] == 1) score += 50
+                            if (r < 7 && currentBoard[r + 1][c] == 1) score += 50
+                            if (c > 0 && currentBoard[r][c - 1] == 1) score += 50
+                            if (c < 7 && currentBoard[r][c + 1] == 1) score += 50
+
+                            // 4. Trap Hole Avoidance (-250)
+                            var neighbors = 0
+                            if (r > 0 && currentBoard[r - 1][c] == 1) neighbors++
+                            if (r < 7 && currentBoard[r + 1][c] == 1) neighbors++
+                            if (c > 0 && currentBoard[r][c - 1] == 1) neighbors++
+                            if (c < 7 && currentBoard[r][c + 1] == 1) neighbors++
+                            if (neighbors >= 3) score -= 250 // Avoid leaving 1-tile traps!
 
                             if (score > bestScore) {
                                 bestScore = score
-                                bestCell = candidate
+                                bestTarget = pos
                             }
                         }
                     }
 
-                    val targetR = bestCell.first
-                    val targetC = bestCell.second
-                    virtualBoard[targetR][targetC] = 1
+                    if (bestTarget != null) {
+                        val toGridX = gridLeft + (bestTarget.second + 0.5f) * cellW
+                        val toGridY = gridTop + (bestTarget.first + 0.5f) * cellH + fingerOffsetY
 
-                    // Target grid coordinates
-                    val toGridX = gridLeft + (targetC + 0.5f) * cellW
-                    val toGridY = gridTop + (targetR + 0.5f) * cellH
-
-                    // Execute smooth Drag & Drop gesture from bottom slot to target grid cell
-                    tapService.dragAndDrop(fromSlotX, slotY, toGridX, toGridY, 320L)
-                    ControllerStateRepository.incrementPlacements()
-                    delay(480L)
-
-                    // Check and clear full rows/cols in virtual board
-                    for (rr in 0..7) {
-                        if (virtualBoard[rr].all { it == 1 }) {
-                            for (cc in 0..7) virtualBoard[rr][cc] = 0
-                        }
+                        // Execute accurate Hold-and-Drag
+                        tapService.dragAndDropWithHold(fromSlotX, slotY, toGridX, toGridY, 440L)
+                        ControllerStateRepository.incrementPlacements()
+                        placedAtLeastOne = true
+                        delay(550L) // Wait for board clear animation
                     }
                 }
 
-                cycle++
-                // Reset/refresh board sync every few cycles to prevent desync
-                if (cycle % 4 == 0) {
-                    delay(600L)
-                    // Tap dismiss popups or bonus chests
+                // If all 3 were placed, wait for new set of 3 blocks to drop into tray
+                if (!placedAtLeastOne) {
+                    delay(800L)
+                    // Tap center to dismiss any bonus/level popups
                     tapService.tap(screenW * 0.5f, screenH * 0.70f)
-                    delay(300L)
+                    delay(400L)
                 }
             }
         }
@@ -404,6 +422,7 @@ class OverlayService : Service() {
     private fun stopController() {
         puzzleSolverJob?.cancel()
         puzzleSolverJob = null
+        screenCaptureManager?.stopCapture()
 
         tvStatusIndicator?.apply {
             text = "● OFF"
